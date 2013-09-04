@@ -11,16 +11,15 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
-	"net"
 )
 
 type Container struct {
@@ -68,7 +67,8 @@ type Config struct {
 	AttachStdin     bool
 	AttachStdout    bool
 	AttachStderr    bool
-	PortSpecs       []string
+	PortSpecs       []string // Deprecated - Can be in the format of 8080/tcp
+	ExposedPorts    map[Port]struct{}
 	Tty             bool // Attach standard streams to a tty, including stdin if it is not closed.
 	OpenStdin       bool // Open stdin
 	StdinOnce       bool // If true, close stdin after the 1 attached client disconnects.
@@ -88,6 +88,7 @@ type HostConfig struct {
 	Binds           []string
 	ContainerIDFile string
 	LxcConf         []KeyValuePair
+	PortBindings    map[Port][]PortBinding
 }
 
 type BindMap struct {
@@ -103,6 +104,22 @@ var (
 type KeyValuePair struct {
 	Key   string
 	Value string
+}
+
+type PortBinding struct {
+	HostIp   string
+	HostPort string
+}
+
+// tcp/80
+type Port string
+
+func (p Port) Proto() string {
+	return strings.Split(string(p), "/")[0]
+}
+
+func (p Port) Port() string {
+	return strings.Split(string(p), "/")[1]
 }
 
 func ParseRun(args []string, capabilities *Capabilities) (*Config, *HostConfig, *flag.FlagSet, error) {
@@ -203,9 +220,15 @@ func ParseRun(args []string, capabilities *Capabilities) (*Config, *HostConfig, 
 		return nil, nil, cmd, err
 	}
 
+	ports, portBindings, err := parsePortSpecs(flPorts)
+	if err != nil {
+		return nil, nil, cmd, err
+	}
+
 	config := &Config{
 		Hostname:        *flHostname,
-		PortSpecs:       flPorts,
+		PortSpecs:       nil, // Deprecated
+		ExposedPorts:    ports,
 		User:            *flUser,
 		Tty:             *flTty,
 		NetworkDisabled: !*flNetwork,
@@ -225,10 +248,12 @@ func ParseRun(args []string, capabilities *Capabilities) (*Config, *HostConfig, 
 		Privileged:      *flPrivileged,
 		WorkingDir:      *flWorkingDir,
 	}
+
 	hostConfig := &HostConfig{
 		Binds:           binds,
 		ContainerIDFile: *flContainerIDFile,
 		LxcConf:         lxcConf,
+		PortBindings:    portBindings,
 	}
 
 	if capabilities != nil && *flMemory > 0 && !capabilities.SwapLimit {
@@ -243,24 +268,24 @@ func ParseRun(args []string, capabilities *Capabilities) (*Config, *HostConfig, 
 	return config, hostConfig, cmd, nil
 }
 
-type PortMapping map[string]string
+type PortMapping map[string]string // Deprecated
 
 type NetworkSettings struct {
 	IPAddress   string
 	IPPrefixLen int
 	Gateway     string
 	Bridge      string
-	PortMapping map[string]PortMapping
+	PortMapping map[string]PortMapping // Deprecated
+	Ports       map[Port][]PortBinding
 }
 
 // String returns a human-readable description of the port mapping defined in the settings
 func (settings *NetworkSettings) PortMappingHuman() string {
 	var mapping []string
-	for private, public := range settings.PortMapping["Tcp"] {
-		mapping = append(mapping, fmt.Sprintf("%s->%s", public, private))
-	}
-	for private, public := range settings.PortMapping["Udp"] {
-		mapping = append(mapping, fmt.Sprintf("%s->%s/udp", public, private))
+	for port, bindings := range settings.Ports {
+		for _, binding := range bindings {
+			mapping = append(mapping, fmt.Sprintf("%s:%s->%s", binding.HostIp, port, binding.HostPort))
+		}
 	}
 	sort.Strings(mapping)
 	return strings.Join(mapping, ", ")
@@ -542,7 +567,7 @@ func (container *Container) Start(hostConfig *HostConfig) error {
 	container.State.Lock()
 	defer container.State.Unlock()
 
-	if len(hostConfig.Binds) == 0 && len(hostConfig.LxcConf) == 0 {
+	if len(hostConfig.Binds) == 0 && len(hostConfig.LxcConf) == 0 && len(hostConfig.PortBindings) == 0 {
 		hostConfig, _ = container.ReadHostConfig()
 	}
 
@@ -555,7 +580,7 @@ func (container *Container) Start(hostConfig *HostConfig) error {
 	if container.runtime.networkManager.disabled {
 		container.Config.NetworkDisabled = true
 	} else {
-		if err := container.allocateNetwork(); err != nil {
+		if err := container.allocateNetwork(hostConfig); err != nil {
 			return err
 		}
 	}
@@ -795,7 +820,7 @@ func (container *Container) StderrPipe() (io.ReadCloser, error) {
 	return utils.NewBufReader(reader), nil
 }
 
-func (container *Container) allocateNetwork() error {
+func (container *Container) allocateNetwork(hostConfig *HostConfig) error {
 	if container.Config.NetworkDisabled {
 		return nil
 	}
@@ -813,45 +838,67 @@ func (container *Container) allocateNetwork() error {
 			iface = &NetworkInterface{disabled: true}
 		} else {
 			iface = &NetworkInterface{
-				IPNet: net.IPNet{IP: net.ParseIP(container.NetworkSettings.IPAddress), Mask: manager.bridgeNetwork.Mask},
+				IPNet:   net.IPNet{IP: net.ParseIP(container.NetworkSettings.IPAddress), Mask: manager.bridgeNetwork.Mask},
 				Gateway: manager.bridgeNetwork.IP,
 				manager: manager,
-				}
+			}
 			ipNum := ipToInt(iface.IPNet.IP)
 			manager.ipAllocator.inUse[ipNum] = struct{}{}
 		}
 	}
 
-	var portSpecs []string
-	if !container.State.Ghost {
-		portSpecs = container.Config.PortSpecs
-	} else {
-		for backend, frontend := range container.NetworkSettings.PortMapping["Tcp"] {
-			portSpecs = append(portSpecs, fmt.Sprintf("%s:%s/tcp",frontend, backend))
+	if container.Config.PortSpecs != nil {
+		if err := migratePortMappings(container.Config); err != nil {
+			return err
 		}
-		for backend, frontend := range container.NetworkSettings.PortMapping["Udp"] {
-			portSpecs = append(portSpecs, fmt.Sprintf("%s:%s/udp",frontend, backend))
+		container.Config.PortSpecs = nil
+	}
+
+	portSpecs := make(map[Port]struct{})
+	bindings := make(map[Port][]PortBinding)
+
+	if !container.State.Ghost {
+		if container.Config.ExposedPorts != nil {
+			portSpecs = container.Config.ExposedPorts
+		}
+		if hostConfig.PortBindings != nil {
+			bindings = hostConfig.PortBindings
+		}
+	} else {
+		if container.NetworkSettings.Ports != nil {
+			for port, binding := range container.NetworkSettings.Ports {
+				portSpecs[port] = struct{}{}
+				bindings[port] = binding
+			}
 		}
 	}
 
-	container.NetworkSettings.PortMapping = make(map[string]PortMapping)
-	container.NetworkSettings.PortMapping["Tcp"] = make(PortMapping)
-	container.NetworkSettings.PortMapping["Udp"] = make(PortMapping)
-	for _, spec := range portSpecs {
-		nat, err := iface.AllocatePort(spec)
-		if err != nil {
-			iface.Release()
-			return err
+	container.NetworkSettings.PortMapping = nil
+
+	for port := range portSpecs {
+		binding := bindings[port]
+		for i := 0; i < len(binding); i++ {
+			b := binding[i]
+			nat, err := iface.AllocatePort(port, b)
+			if err != nil {
+				iface.Release()
+				return err
+			}
+			utils.Debugf("Allocate port: %s:%s->%s", nat.Binding.HostIp, port, nat.Binding.HostPort)
+			binding[i] = nat.Binding
 		}
-		proto := strings.Title(nat.Proto)
-		backend, frontend := strconv.Itoa(nat.Backend), strconv.Itoa(nat.Frontend)
-		container.NetworkSettings.PortMapping[proto][backend] = frontend
+		bindings[port] = binding
 	}
+	container.SaveHostConfig(hostConfig)
+
+	container.NetworkSettings.Ports = bindings
 	container.network = iface
+
 	container.NetworkSettings.Bridge = container.runtime.networkManager.bridgeIface
 	container.NetworkSettings.IPAddress = iface.IPNet.IP.String()
 	container.NetworkSettings.IPPrefixLen, _ = iface.IPNet.Mask.Size()
 	container.NetworkSettings.Gateway = iface.Gateway.String()
+
 	return nil
 }
 

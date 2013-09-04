@@ -365,3 +365,20 @@ func TestParseRelease(t *testing.T) {
 	assertParseRelease(t, "3.4.54.longterm-1", &KernelVersionInfo{Kernel: 3, Major: 4, Minor: 54, Flavor: "1"}, 0)
 	assertParseRelease(t, "3.8.0-19-generic", &KernelVersionInfo{Kernel: 3, Major: 8, Minor: 0, Flavor: "19-generic"}, 0)
 }
+
+func TestParsePortMapping(t *testing.T) {
+	data := PartParser("ip:public:private", "192.168.1.1:80:8080")
+
+	if len(data) != 3 {
+		t.FailNow()
+	}
+	if data["ip"] != "192.168.1.1" {
+		t.Fail()
+	}
+	if data["public"] != "80" {
+		t.Fail()
+	}
+	if data["private"] != "8080" {
+		t.Fail()
+	}
+}

@@ -802,7 +802,7 @@ func StripComments(input []byte, commentMarker []byte) []byte {
 	var output []byte
 	for _, currentLine := range lines {
 		var commentIndex = bytes.Index(currentLine, commentMarker)
-		if ( commentIndex == -1 ) {
+		if commentIndex == -1 {
 			output = append(output, currentLine...)
 		} else {
 			output = append(output, currentLine[:commentIndex]...)
@@ -888,4 +888,23 @@ func UserLookup(uid string) (*user.User, error) {
 		}
 	}
 	return nil, fmt.Errorf("User not found in /etc/passwd")
+}
+
+func PartParser(template, data string) (map[string]string, error) {
+	// ip:public:private
+	templateParts := strings.Split(template, ":")
+	parts := strings.Split(data, ":")
+	if len(parts) != len(templateParts) {
+		return nil, fmt.Errorf("Invalid format to parse.  %s should match template %s", data, template)
+	}
+	out := make(map[string]string, len(templateParts))
+
+	for i, t := range templateParts {
+		value := ""
+		if len(parts) > i {
+			value = parts[i]
+		}
+		out[t] = value
+	}
+	return out, nil
 }

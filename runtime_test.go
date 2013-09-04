@@ -286,6 +286,7 @@ func startEchoServerContainer(t *testing.T, proto string) (*Runtime, *Container,
 	port := 5554
 	var container *Container
 	var strPort string
+	var p Port
 	for {
 		port += 1
 		strPort = strconv.Itoa(port)
@@ -298,22 +299,33 @@ func startEchoServerContainer(t *testing.T, proto string) (*Runtime, *Container,
 			t.Fatal(fmt.Errorf("Unknown protocol %v", proto))
 		}
 		t.Log("Trying port", strPort)
+		ep := make(map[Port]struct{}, 1)
+		p = Port(fmt.Sprintf("%s/%s", proto, strPort))
+		ep[p] = struct{}{}
+
 		container, err = NewBuilder(runtime).Create(&Config{
-			Image:     GetTestImage(runtime).ID,
-			Cmd:       []string{"sh", "-c", cmd},
-			PortSpecs: []string{fmt.Sprintf("%s/%s", strPort, proto)},
+			Image:        GetTestImage(runtime).ID,
+			Cmd:          []string{"sh", "-c", cmd},
+			PortSpecs:    []string{fmt.Sprintf("%s/%s", strPort, proto)},
+			ExposedPorts: ep,
 		})
-		if container != nil {
-			break
-		}
 		if err != nil {
 			nuke(runtime)
 			t.Fatal(err)
 		}
+
+		if container != nil {
+			break
+		}
 		t.Logf("Port %v already in use", strPort)
 	}
 
-	hostConfig := &HostConfig{}
+	hostConfig := &HostConfig{
+		PortBindings: make(map[Port][]PortBinding),
+	}
+	hostConfig.PortBindings[p] = []PortBinding{
+		{},
+	}
 	if err := container.Start(hostConfig); err != nil {
 		nuke(runtime)
 		t.Fatal(err)
@@ -328,7 +340,7 @@ func startEchoServerContainer(t *testing.T, proto string) (*Runtime, *Container,
 	// Even if the state is running, lets give some time to lxc to spawn the process
 	container.WaitTimeout(500 * time.Millisecond)
 
-	strPort = container.NetworkSettings.PortMapping[strings.Title(proto)][strPort]
+	strPort = container.NetworkSettings.Ports[p][0].HostPort
 	return runtime, container, strPort
 }
 
